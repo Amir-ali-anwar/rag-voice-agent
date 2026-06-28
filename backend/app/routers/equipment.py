@@ -1,0 +1,267 @@
+import os
+import tempfile
+import uuid
+from datetime import datetime
+from typing import List, Optional
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
+from loguru import logger
+from bson import ObjectId
+from app.services.text_extraction import TextExtractionService
+from app.services.embeddings import EmbeddingService
+from app.database import get_database
+from app.models.equipment import Equipment
+from app.config import settings
+
+
+router = APIRouter()
+
+
+@router.post("/", response_model=Equipment, status_code=status.HTTP_201_CREATED)
+async def create_equipment(equipment: Equipment):
+    db = get_database()
+    
+    isExist = await db.equipment.find_one({"name": equipment.name.strip(), "tenant_id": equipment.tenant_id})
+    if isExist:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Equipment already exists")
+    
+    now = datetime.utcnow()
+    equipment_dict = equipment.model_dump(exclude={"id"}, exclude_none=True)
+    equipment_dict["created_at"] = now
+    equipment_dict["updated_at"] = now
+
+    result = await db.equipment.insert_one(equipment_dict)
+    response_dict = equipment.model_dump(exclude={"id"}, exclude_none=True)
+    response_dict["_id"] = str(result.inserted_id)
+    return Equipment(**response_dict)
+
+
+@router.get("/", response_model=List[Equipment], status_code=status.HTTP_200_OK)
+async def get_all_equipment():
+    db = get_database()
+    equipments = await db.equipment.find().to_list(length=None)
+    result = []
+
+    for item in equipments:
+        item_dict = dict(item)
+
+        if "_id" in item_dict and isinstance(item_dict["_id"], ObjectId):
+            item_dict["_id"] = str(item_dict["_id"])
+        result.append(Equipment(**item_dict))
+    return result
+
+
+@router.get("/{equipment_id}", response_model=Equipment, status_code=status.HTTP_200_OK)
+async def get_one_equipment(equipment_id: str):
+    """Get an equipment by ID"""
+    db = get_database()
+    equipment = await db.equipment.find_one({"_id": ObjectId(equipment_id)})
+    if not equipment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Equipment not found")
+    
+    item_dict = dict(equipment)
+    if "_id" in item_dict and isinstance(item_dict["_id"], ObjectId):
+        item_dict["_id"] = str(item_dict["_id"])
+    
+    return Equipment(**item_dict)
+
+
+@router.post("/{equipment_id}/documents", status_code=status.HTTP_201_CREATED)
+async def upload_equipment_documents(
+    equipment_id: str,
+    files: List[UploadFile] = File(...),
+    description: Optional[str] = Form(None),
+):
+
+    db= get_database()
+
+    # Validate equipment exists
+    equipment = await db.equipment.find_one({"_id": ObjectId(equipment_id)})
+    if not equipment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Equipment not found")
+
+    text_extrac_service = TextExtractionService()
+    embedding_service = EmbeddingService()
+    tenant_id= settings.TENANT_ID
+
+    created_docs = []
+
+    for file in files:
+        try:
+            data = await file.read()
+            size = len(data)
+            original_name = file.filename or "upload.bin"
+            content_type = file.content_type or "application/octet-stream"
+            logger.info(f"Processing file: {original_name} ({size} bytes)")
+
+            if not text_extrac_service.is_supported_mime(content_type):
+                logger.warning(f"Skipping {original_name}, unsupported type: {content_type}")
+                continue
+
+            temp_file_path = None
+
+            try:
+                _, ext = os.path.splitext(original_name)
+                with tempfile.mktemp(suffix=ext, delete=False) as tmp:
+                    await tmp.write(data)
+                    temp_file_path= tmp.name
+
+                try:
+                    extracted_text = text_extrac_service.extract_text(temp_file_path, content_type)
+                except ValueError as e:
+                    logger.warning(f"Skipping {original_name}, unsupported type: {content_type}")
+                    continue
+                except FileNotFoundError as e:
+                    logger.error(f"File not found: {original_name} - {str(e)}")
+                    continue
+                except Exception as e:
+                    logger.error(f"Text extraction failed: {original_name} - {str(e)}")
+                    continue
+
+                logger.info(
+                    "Text extracted from document",
+                    file_name=original_name,
+                    text_length=len(extracted_text or "")
+                )
+
+                if not extracted_text or not extracted_text.strip():
+                    logger.warning(f"EMPTY_DOCUMENT: No text content extracted from {original_name}")
+                    continue
+
+                chunks = embedding_service.split_text(extracted_text)
+                logger.info(
+                    "Document text split into chunks",
+                    file_name=original_name,
+                    chunk_count=len(chunks),
+                )
+
+                if not chunks: 
+                    raise ValueError("NO_CHUNKS: Text splitting resulted in no chunks")
+
+                storage_key = f"{tenant_id}/{equipment_id}/documents/{uuid.uuid4().hex}-{original_name}"
+
+                now  = datetime.utcnow()
+
+                doc_dict = {
+                    "equipment_id": ObjectId(equipment_id),
+                    "tenant_id": tenant_id,
+                    "file_name": original_name,
+                    "content_type": content_type,
+                    "size": size,
+                    "storage_key": storage_key,
+                    "uploaded_by": settings.USER_ID,
+                    "description": description,
+                    "document_type": "knowledge",
+                    "embedding_status": "processing",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+
+                doc_result = await db.documents_metadata.insert_one(doc_dict)
+                document_id = doc_result.inserted_id
+                logger.info("Document inserted with processing status", document_id=str(document_id))
+
+                chunk_documents= []
+
+                for index, chunk_text in enumerate(chunks):
+                    try:
+                        embedding_vector =  embedding_service.embed_text(chunk_text)
+                        chunk_doc = {
+                            "document_id": document_id,
+                            "equipment_id": ObjectId(equipment_id),
+                            "tenant_id": tenant_id,
+                            "file_name": original_name,
+                            "chunk_id": str(uuid.uuid4()),
+                            "chunk_index": index,
+                            "text": chunk_text,
+                            "embedding": embedding_vector,
+                            "is_disabled": False,
+                        }
+                        chunk_documents.append(chunk_doc)
+
+                        if(index + 1) % 10 == 0:
+                            await db.chunks.insert_many(chunk_documents)
+                            chunk_documents = []
+                            logger.info(
+                                "Uploaded documents in bulk",
+                                file_name=original_name,
+                                progress=f"{index + 1}/{len(chunks)}"
+                            )
+                    except Exception as e:
+                        logger.error(
+                            "Chunk embedding failed",
+                            file_name=original_name,
+                            chunk_index=index,
+                            error=str(e)
+                        )
+                        continue
+
+                    if not chunk_documents:
+                        await db.documents.metadata.update_one(
+                            {"_id": document_id},
+                            { "$set": { "embedding_status": "failed" }}
+                        )
+                        logger.info(
+                            "Document embedding completed",
+                            document_id=str(document_id),
+                            file_name=original_name,
+                        )
+                        raise Exception("EMBEDDING_FAILED: Failed to generate embeddings for all chunks")
+                    
+                    await db[settings.DOCUMENT_CHUNKS_COLLECTION].insert_many(chunk_documents)
+                    logger.info(
+                        "Documents inserted in bulk",
+                        document_id=str(document_id),
+                        chunks_inserted=len(chunk_documents),
+                    )
+                    await db.documents.metadata.update_one(
+                        {"_id": document_id},
+                        { "$set": { "embedding_status": "completed", "updated_at": datetime.utcnow() }}
+                    )
+                    logger.info(
+                        "Document embedding completed",
+                        document_id=str(document_id),
+                        chunks_created=len(chunk_documents),
+                        total_chunks=len(chunks),
+                    )
+
+                    doc_dict["_id"] = str(document_id)
+                    doc_dict["equipment_id"] = str(doc_dict["equipment_id"])
+
+                    if isinstance(doc_dict.get("created_at"), datetime):
+                        doc_dict["created_at"] = doc_dict["created_at"].isoformat()
+                    if isinstance(doc_dict.get("updated_at"), datetime):
+                        doc_dict["updated_at"] = doc_dict["updated_at"].isoformat()
+                    
+                    created_docs.append(doc_dict)
+
+                    logger.success(
+                        "Document processing completed"
+                    )
+
+            finally:
+                if temp_file_path and os.path.exists(temp_file_path):
+                    try:
+                        os.unlink(temp_file_path)
+                        logger.info(f"Deleted temp file: {temp_file_path}")
+                    except OSError as e:
+                        logger.error(f"Error deleting temp file: {temp_file_path} - {str(e)}") 
+                        
+
+        except Exception as e:
+            logger.error(f"Error processing file {file.filename}: {e}", exc_info=True)
+            continue
+    return {"documents": created_docs, "count": len(created_docs)}
+               
+
+                    
+
+                        
+
+                
+
+
+
+
+    
+    
+    
